@@ -4,6 +4,8 @@ pragma solidity ^0.8.20;
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
@@ -325,6 +327,32 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
     function isTicketListed(uint256 tokenId) external view returns (bool) {
         TicketInfo memory ticket = _requireTicketView(tokenId);
         return ticket.listed && _listings[tokenId].active;
+    }
+
+    function getTicketCheckInMessageHash(
+        uint256 tokenId,
+        address claimedOwner,
+        uint256 expiresAt
+    ) public view returns (bytes32) {
+        return keccak256(abi.encodePacked(address(this), block.chainid, tokenId, claimedOwner, expiresAt));
+    }
+
+    function verifySignedTicket(
+        uint256 tokenId,
+        address claimedOwner,
+        uint256 expiresAt,
+        bytes calldata signature
+    ) public view returns (bool) {
+        if (block.timestamp > expiresAt) return false;
+        if (claimedOwner == address(0)) return false;
+        if (_ownerOf(tokenId) != claimedOwner) return false;
+        if (!this.isTicketValid(tokenId)) return false;
+
+        bytes32 messageHash = getTicketCheckInMessageHash(tokenId, claimedOwner, expiresAt);
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        (address recovered, ECDSA.RecoverError error, ) = ECDSA.tryRecover(ethSignedMessageHash, signature);
+
+        return error == ECDSA.RecoverError.NoError && recovered == claimedOwner;
     }
 
     function _checkPurchaseEligibility(address buyer, uint256 eventId) internal view virtual returns (bool) {
