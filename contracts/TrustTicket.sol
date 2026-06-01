@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -29,6 +30,7 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         uint256 resaleStart;
         uint256 resaleEnd;
         bool active;
+        bool canceled;
     }
 
     struct TicketInfo {
@@ -45,6 +47,23 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         address seller;
         uint256 price;
         bool active;
+    }
+
+    struct MembershipPolicy {
+        bool enabled;
+        address membershipToken;
+        uint256 memberPrice;
+        uint256 memberPresaleStart;
+        uint256 memberPresaleEnd;
+        bool publicSaleDiscount;
+    }
+
+    struct EscrowPayment {
+        address payer;
+        address payee;
+        uint256 amount;
+        bool refunded;
+        bool withdrawn;
     }
 
     error NotOrganizer();
@@ -68,6 +87,14 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
     error PriceCapExceeded();
     error PaymentTransferFailed();
     error PurchaseNotEligible();
+    error EventCanceled();
+    error EventNotCanceled();
+    error NoEscrowBalance();
+    error EscrowAlreadyWithdrawn();
+    error EscrowAlreadyRefunded();
+    error MembershipPassRequired();
+    error InvalidMembershipPolicy();
+    error InvalidMembershipToken();
 
     uint256 private _nextEventId = 1;
     uint256 private _nextTokenId = 1;
@@ -76,11 +103,23 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
     mapping(uint256 => EventInfo) private _events;
     mapping(uint256 => TicketInfo) private _tickets;
     mapping(uint256 => ListingInfo) private _listings;
+    mapping(uint256 => MembershipPolicy) private _membershipPolicies;
     mapping(uint256 => uint256[]) private _eventTickets;
     mapping(uint256 => mapping(address => bool)) private _eventValidators;
+    mapping(uint256 => EscrowPayment) private _primaryPayments;
+    mapping(uint256 => EscrowPayment) private _resalePayments;
+    mapping(uint256 => uint256) private _eventEscrowBalances;
+    mapping(address => uint256) private _resaleEscrowBalances;
+    mapping(uint256 => bool) private _eventRevenueWithdrawn;
 
     event OrganizerAdded(address indexed organizer);
     event ValidatorAdded(address indexed validator, uint256 indexed eventId);
+    event MembershipPolicyUpdated(
+        uint256 indexed eventId,
+        address indexed membershipToken,
+        bool enabled,
+        uint256 memberPrice
+    );
     event EventCreated(uint256 indexed eventId, address indexed organizer, string eventName);
     event TicketMinted(uint256 indexed eventId, uint256 indexed tokenId, string seatInfo);
     event TicketPurchased(uint256 indexed eventId, uint256 indexed tokenId, address indexed buyer, uint256 price);
@@ -89,6 +128,10 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
     event TicketResold(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price);
     event TicketUsed(uint256 indexed tokenId, uint256 indexed eventId, address indexed validator);
     event EventStatusChanged(uint256 indexed eventId, bool active);
+    event EventCancellationRecorded(uint256 indexed eventId);
+    event EventRevenueWithdrawn(uint256 indexed eventId, address indexed organizer, uint256 amount);
+    event ResaleRevenueWithdrawn(address indexed seller, uint256 amount);
+    event TicketRefunded(uint256 indexed tokenId, address indexed buyer, uint256 amount);
 
     constructor(address admin) ERC721("TRUST-TICKET", "TRUST") {
         if (admin == address(0)) revert InvalidAddress();
@@ -153,10 +196,42 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
             maxResalePriceRate: maxResalePriceRate,
             resaleStart: resaleStart,
             resaleEnd: resaleEnd,
-            active: true
+            active: true,
+            canceled: false
         });
 
         emit EventCreated(eventId, msg.sender, eventName);
+    }
+
+    function setMembershipPolicy(
+        uint256 eventId,
+        bool enabled,
+        address membershipToken,
+        uint256 memberPrice,
+        uint256 memberPresaleStart,
+        uint256 memberPresaleEnd,
+        bool publicSaleDiscount
+    ) external {
+        EventInfo storage eventInfo = _requireEvent(eventId);
+        if (msg.sender != eventInfo.organizer && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
+            revert NotEventOrganizer();
+        }
+        if (enabled) {
+            if (membershipToken == address(0) || membershipToken.code.length == 0) revert InvalidMembershipToken();
+            if (memberPrice == 0 || memberPrice > eventInfo.ticketPrice) revert InvalidMembershipPolicy();
+            if (memberPresaleStart >= memberPresaleEnd) revert InvalidSaleWindow();
+        }
+
+        _membershipPolicies[eventId] = MembershipPolicy({
+            enabled: enabled,
+            membershipToken: membershipToken,
+            memberPrice: memberPrice,
+            memberPresaleStart: memberPresaleStart,
+            memberPresaleEnd: memberPresaleEnd,
+            publicSaleDiscount: publicSaleDiscount
+        });
+
+        emit MembershipPolicyUpdated(eventId, membershipToken, enabled, memberPrice);
     }
 
     function setEventStatus(uint256 eventId, bool active) external {
@@ -166,6 +241,17 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         }
         eventInfo.active = active;
         emit EventStatusChanged(eventId, active);
+    }
+
+    function cancelEvent(uint256 eventId) external {
+        EventInfo storage eventInfo = _requireEvent(eventId);
+        if (msg.sender != eventInfo.organizer && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
+            revert NotEventOrganizer();
+        }
+        eventInfo.active = false;
+        eventInfo.canceled = true;
+        emit EventStatusChanged(eventId, false);
+        emit EventCancellationRecorded(eventId);
     }
 
     function mintTicket(uint256 eventId, string calldata seatInfo) external returns (uint256 tokenId) {
@@ -193,10 +279,9 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         EventInfo storage eventInfo = _requireEvent(ticket.eventId);
 
         if (!eventInfo.active) revert EventInactive();
-        if (block.timestamp < eventInfo.primarySaleStart || block.timestamp > eventInfo.primarySaleEnd) {
-            revert PrimarySaleClosed();
-        }
-        if (msg.value != eventInfo.ticketPrice) revert InvalidPrice();
+        if (eventInfo.canceled) revert EventCanceled();
+        uint256 requiredPrice = _purchasePrice(msg.sender, eventInfo);
+        if (msg.value != requiredPrice) revert InvalidPrice();
         if (!_checkPurchaseEligibility(msg.sender, ticket.eventId)) revert PurchaseNotEligible();
         if (ticket.used) revert TicketUsedError();
         if (ticket.listed) revert TicketListedError();
@@ -204,10 +289,15 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         if (eventInfo.remainingTicketCount == 0) revert TicketUnavailable();
 
         eventInfo.remainingTicketCount -= 1;
+        _eventEscrowBalances[ticket.eventId] += msg.value;
+        _primaryPayments[tokenId] = EscrowPayment({
+            payer: msg.sender,
+            payee: eventInfo.organizer,
+            amount: msg.value,
+            refunded: false,
+            withdrawn: false
+        });
         _safeTransfer(address(this), msg.sender, tokenId, "");
-
-        (bool paid, ) = eventInfo.organizer.call{value: msg.value}("");
-        if (!paid) revert PaymentTransferFailed();
 
         emit TicketPurchased(ticket.eventId, tokenId, msg.sender, msg.value);
     }
@@ -218,6 +308,7 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
 
         if (ownerOf(tokenId) != msg.sender) revert NotTicketOwner();
         if (!eventInfo.active) revert EventInactive();
+        if (eventInfo.canceled) revert EventCanceled();
         if (ticket.used) revert TicketUsedError();
         if (ticket.listed) revert TicketListedError();
         if (!eventInfo.resaleAllowed) revert ResaleNotAllowed();
@@ -253,6 +344,7 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         ListingInfo memory listing = _listings[tokenId];
 
         if (!eventInfo.active) revert EventInactive();
+        if (eventInfo.canceled) revert EventCanceled();
         if (ticket.used) revert TicketUsedError();
         if (!ticket.listed || !listing.active) revert TicketNotListed();
         if (block.timestamp < eventInfo.resaleStart || block.timestamp > eventInfo.resaleEnd) revert ResaleClosed();
@@ -263,15 +355,74 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
 
         ticket.listed = false;
         delete _listings[tokenId];
+        _resaleEscrowBalances[listing.seller] += msg.value;
+        _resalePayments[tokenId] = EscrowPayment({
+            payer: msg.sender,
+            payee: listing.seller,
+            amount: msg.value,
+            refunded: false,
+            withdrawn: false
+        });
 
         _marketplaceTransfer = true;
         _safeTransfer(listing.seller, msg.sender, tokenId, "");
         _marketplaceTransfer = false;
 
-        (bool paid, ) = listing.seller.call{value: msg.value}("");
+        emit TicketResold(tokenId, listing.seller, msg.sender, msg.value);
+    }
+
+    function withdrawEventRevenue(uint256 eventId) external nonReentrant {
+        EventInfo storage eventInfo = _requireEvent(eventId);
+        if (msg.sender != eventInfo.organizer) revert NotEventOrganizer();
+        if (eventInfo.canceled) revert EventCanceled();
+        if (_eventRevenueWithdrawn[eventId]) revert EscrowAlreadyWithdrawn();
+        uint256 amount = _eventEscrowBalances[eventId];
+        if (amount == 0) revert NoEscrowBalance();
+
+        _eventRevenueWithdrawn[eventId] = true;
+        _eventEscrowBalances[eventId] = 0;
+
+        (bool paid, ) = msg.sender.call{value: amount}("");
         if (!paid) revert PaymentTransferFailed();
 
-        emit TicketResold(tokenId, listing.seller, msg.sender, msg.value);
+        emit EventRevenueWithdrawn(eventId, msg.sender, amount);
+    }
+
+    function withdrawResaleRevenue() external nonReentrant {
+        uint256 amount = _resaleEscrowBalances[msg.sender];
+        if (amount == 0) revert NoEscrowBalance();
+        _resaleEscrowBalances[msg.sender] = 0;
+
+        (bool paid, ) = msg.sender.call{value: amount}("");
+        if (!paid) revert PaymentTransferFailed();
+
+        emit ResaleRevenueWithdrawn(msg.sender, amount);
+    }
+
+    function refundTicket(uint256 tokenId) external nonReentrant {
+        TicketInfo storage ticket = _requireTicket(tokenId);
+        EventInfo storage eventInfo = _requireEvent(ticket.eventId);
+        if (!eventInfo.canceled) revert EventNotCanceled();
+        if (ownerOf(tokenId) != msg.sender) revert NotTicketOwner();
+
+        uint256 refundAmount = _refundResaleIfPossible(tokenId);
+        if (refundAmount == 0) {
+            refundAmount = _refundPrimaryIfPossible(tokenId, ticket.eventId);
+        }
+        if (refundAmount == 0) revert NoEscrowBalance();
+
+        ticket.used = true;
+        if (ticket.listed) {
+            address seller = _listings[tokenId].seller;
+            ticket.listed = false;
+            delete _listings[tokenId];
+            emit TicketListingCanceled(tokenId, seller);
+        }
+
+        (bool paid, ) = msg.sender.call{value: refundAmount}("");
+        if (!paid) revert PaymentTransferFailed();
+
+        emit TicketRefunded(tokenId, msg.sender, refundAmount);
     }
 
     function useTicket(uint256 tokenId) external {
@@ -302,6 +453,28 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
     function getListingInfo(uint256 tokenId) external view returns (ListingInfo memory) {
         _requireTicketView(tokenId);
         return _listings[tokenId];
+    }
+
+    function getMembershipPolicy(uint256 eventId) external view returns (MembershipPolicy memory) {
+        _requireEventView(eventId);
+        return _membershipPolicies[eventId];
+    }
+
+    function hasMembershipPass(uint256 eventId, address account) external view returns (bool) {
+        if (account == address(0)) revert InvalidAddress();
+        MembershipPolicy memory policy = _membershipPolicies[eventId];
+        if (!policy.enabled) return false;
+        return _hasMembership(policy.membershipToken, account);
+    }
+
+    function getEventEscrowBalance(uint256 eventId) external view returns (uint256) {
+        _requireEventView(eventId);
+        return _eventEscrowBalances[eventId];
+    }
+
+    function getResaleEscrowBalance(address seller) external view returns (uint256) {
+        if (seller == address(0)) revert InvalidAddress();
+        return _resaleEscrowBalances[seller];
     }
 
     function getTicketsByEvent(uint256 eventId) external view returns (uint256[] memory) {
@@ -359,6 +532,54 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         buyer;
         eventId;
         return true;
+    }
+
+    function _purchasePrice(address buyer, EventInfo storage eventInfo) private view returns (uint256) {
+        MembershipPolicy memory policy = _membershipPolicies[eventInfo.eventId];
+        if (
+            policy.enabled &&
+            block.timestamp >= policy.memberPresaleStart &&
+            block.timestamp <= policy.memberPresaleEnd
+        ) {
+            if (!_hasMembership(policy.membershipToken, buyer)) revert MembershipPassRequired();
+            return policy.memberPrice;
+        }
+
+        if (block.timestamp < eventInfo.primarySaleStart || block.timestamp > eventInfo.primarySaleEnd) {
+            revert PrimarySaleClosed();
+        }
+
+        if (policy.enabled && policy.publicSaleDiscount && _hasMembership(policy.membershipToken, buyer)) {
+            return policy.memberPrice;
+        }
+        return eventInfo.ticketPrice;
+    }
+
+    function _hasMembership(address membershipToken, address account) private view returns (bool) {
+        if (membershipToken == address(0)) return false;
+        return IERC721(membershipToken).balanceOf(account) > 0;
+    }
+
+    function _refundPrimaryIfPossible(uint256 tokenId, uint256 eventId) private returns (uint256) {
+        EscrowPayment storage payment = _primaryPayments[tokenId];
+        if (payment.amount == 0 || payment.refunded) return 0;
+        if (_eventRevenueWithdrawn[eventId] || payment.withdrawn) revert EscrowAlreadyWithdrawn();
+        if (_eventEscrowBalances[eventId] < payment.amount) revert EscrowAlreadyWithdrawn();
+
+        payment.refunded = true;
+        _eventEscrowBalances[eventId] -= payment.amount;
+        return payment.amount;
+    }
+
+    function _refundResaleIfPossible(uint256 tokenId) private returns (uint256) {
+        EscrowPayment storage payment = _resalePayments[tokenId];
+        if (payment.amount == 0 || payment.refunded) return 0;
+        if (payment.withdrawn) revert EscrowAlreadyWithdrawn();
+        if (_resaleEscrowBalances[payment.payee] < payment.amount) revert EscrowAlreadyWithdrawn();
+
+        payment.refunded = true;
+        _resaleEscrowBalances[payment.payee] -= payment.amount;
+        return payment.amount;
     }
 
     function _update(
