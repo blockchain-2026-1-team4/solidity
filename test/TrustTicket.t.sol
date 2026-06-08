@@ -122,6 +122,43 @@ contract TrustTicketTest is Test {
         trustTicket.mintTicket(eventId, "B-1");
     }
 
+    function testOrganizerBurnsUnissuedTicket() public {
+        vm.prank(stranger);
+        vm.expectRevert(TrustTicket.NotEventOrganizer.selector);
+        trustTicket.burnUnissuedTicket(tokenId);
+
+        vm.prank(organizer);
+        trustTicket.burnUnissuedTicket(tokenId);
+
+        TrustTicket.EventInfo memory eventInfo = trustTicket.getEventInfo(eventId);
+        assertEq(eventInfo.totalTicketCount, 2);
+        assertEq(eventInfo.remainingTicketCount, 2);
+
+        uint256[] memory eventTickets = trustTicket.getTicketsByEvent(eventId);
+        assertEq(eventTickets.length, 0);
+
+        vm.expectRevert(TrustTicket.TicketUnavailable.selector);
+        trustTicket.getTicketInfo(tokenId);
+
+        vm.warp(primaryStart);
+        vm.prank(buyer);
+        vm.expectRevert(TrustTicket.TicketUnavailable.selector);
+        trustTicket.purchaseTicket{value: 1 ether}(tokenId);
+    }
+
+    function testAdminCanBurnUnissuedTicketButPurchasedTicketCannotBeBurned() public {
+        vm.prank(admin);
+        trustTicket.burnUnissuedTicket(tokenId);
+
+        vm.prank(organizer);
+        uint256 replacementToken = trustTicket.mintTicket(eventId, "A-2");
+        _buyPrimary(buyer, replacementToken);
+
+        vm.prank(organizer);
+        vm.expectRevert(TrustTicket.TicketUnavailable.selector);
+        trustTicket.burnUnissuedTicket(replacementToken);
+    }
+
     function testPrimaryPurchaseEscrowsUntilOrganizerWithdraws() public {
         vm.warp(primaryStart);
         uint256 organizerBalanceBefore = organizer.balance;

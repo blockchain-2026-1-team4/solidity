@@ -125,6 +125,7 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
     );
     event EventCreated(uint256 indexed eventId, address indexed organizer, string eventName);
     event TicketMinted(uint256 indexed eventId, uint256 indexed tokenId, string seatInfo);
+    event TicketBurned(uint256 indexed eventId, uint256 indexed tokenId);
     event TicketPurchased(uint256 indexed eventId, uint256 indexed tokenId, address indexed buyer, uint256 price);
     event TicketListed(uint256 indexed tokenId, address indexed seller, uint256 price);
     event TicketListingCanceled(uint256 indexed tokenId, address indexed seller);
@@ -275,6 +276,28 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         _mint(address(this), tokenId);
 
         emit TicketMinted(eventId, tokenId, seatInfo);
+    }
+
+    function burnUnissuedTicket(uint256 tokenId) external {
+        TicketInfo storage ticket = _requireTicket(tokenId);
+        EventInfo storage eventInfo = _requireEvent(ticket.eventId);
+
+        if (msg.sender != eventInfo.organizer && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
+            revert NotEventOrganizer();
+        }
+        if (ownerOf(tokenId) != address(this)) revert TicketUnavailable();
+        if (ticket.used) revert TicketUsedError();
+        if (ticket.listed) revert TicketListedError();
+        if (eventInfo.remainingTicketCount == 0 || eventInfo.totalTicketCount == 0) revert InvalidTicketSupply();
+
+        uint256 eventId = ticket.eventId;
+        eventInfo.remainingTicketCount -= 1;
+        eventInfo.totalTicketCount -= 1;
+        _removeEventTicket(eventId, tokenId);
+        delete _tickets[tokenId];
+        _burn(tokenId);
+
+        emit TicketBurned(eventId, tokenId);
     }
 
     function purchaseTicket(uint256 tokenId) external payable nonReentrant {
@@ -611,6 +634,18 @@ contract TrustTicket is ERC721Enumerable, AccessControl, ReentrancyGuard {
         (bool paid, ) = payee.call{value: amount}("");
         if (!paid) revert PaymentTransferFailed();
         emit TicketRefunded(tokenId, payee, amount);
+    }
+
+    function _removeEventTicket(uint256 eventId, uint256 tokenId) private {
+        uint256[] storage tokenIds = _eventTickets[eventId];
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            if (tokenIds[i] == tokenId) {
+                tokenIds[i] = tokenIds[tokenIds.length - 1];
+                tokenIds.pop();
+                return;
+            }
+        }
+        revert TicketUnavailable();
     }
 
     function _update(
