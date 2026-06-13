@@ -122,6 +122,43 @@ contract TrustTicketTest is Test {
         trustTicket.mintTicket(eventId, "B-1");
     }
 
+    function testOrganizerBurnsUnissuedTicket() public {
+        vm.prank(stranger);
+        vm.expectRevert(TrustTicket.NotEventOrganizer.selector);
+        trustTicket.burnUnissuedTicket(tokenId);
+
+        vm.prank(organizer);
+        trustTicket.burnUnissuedTicket(tokenId);
+
+        TrustTicket.EventInfo memory eventInfo = trustTicket.getEventInfo(eventId);
+        assertEq(eventInfo.totalTicketCount, 2);
+        assertEq(eventInfo.remainingTicketCount, 2);
+
+        uint256[] memory eventTickets = trustTicket.getTicketsByEvent(eventId);
+        assertEq(eventTickets.length, 0);
+
+        vm.expectRevert(TrustTicket.TicketUnavailable.selector);
+        trustTicket.getTicketInfo(tokenId);
+
+        vm.warp(primaryStart);
+        vm.prank(buyer);
+        vm.expectRevert(TrustTicket.TicketUnavailable.selector);
+        trustTicket.purchaseTicket{value: 1 ether}(tokenId);
+    }
+
+    function testAdminCanBurnUnissuedTicketButPurchasedTicketCannotBeBurned() public {
+        vm.prank(admin);
+        trustTicket.burnUnissuedTicket(tokenId);
+
+        vm.prank(organizer);
+        uint256 replacementToken = trustTicket.mintTicket(eventId, "A-2");
+        _buyPrimary(buyer, replacementToken);
+
+        vm.prank(organizer);
+        vm.expectRevert(TrustTicket.TicketUnavailable.selector);
+        trustTicket.burnUnissuedTicket(replacementToken);
+    }
+
     function testPrimaryPurchaseEscrowsUntilOrganizerWithdraws() public {
         vm.warp(primaryStart);
         uint256 organizerBalanceBefore = organizer.balance;
@@ -136,6 +173,11 @@ contract TrustTicketTest is Test {
         TrustTicket.EventInfo memory eventInfo = trustTicket.getEventInfo(eventId);
         assertEq(eventInfo.remainingTicketCount, 2);
 
+        vm.prank(organizer);
+        vm.expectRevert(TrustTicket.SettlementNotAvailable.selector);
+        trustTicket.withdrawEventRevenue(eventId);
+
+        vm.warp(eventInfo.eventTimestamp);
         vm.prank(organizer);
         trustTicket.withdrawEventRevenue(eventId);
 
@@ -221,6 +263,15 @@ contract TrustTicketTest is Test {
         trustTicket.setMembershipPolicy(eventId, true, stranger, 0.8 ether, block.timestamp + 1 hours, block.timestamp + 2 hours, true);
     }
 
+    function testMembershipTokenCannotBeTransferred() public {
+        vm.prank(admin);
+        fanClubMembership.issueMembership(buyer);
+
+        vm.prank(buyer);
+        vm.expectRevert(FanClubMembership.MembershipTransferRestricted.selector);
+        fanClubMembership.transferFrom(buyer, buyer2, 1);
+    }
+
     function testListingEnforcesOwnerUnusedPeriodPolicyAndPriceCap() public {
         _buyPrimary(buyer, tokenId);
 
@@ -263,7 +314,13 @@ contract TrustTicketTest is Test {
         assertFalse(trustTicket.isTicketListed(tokenId));
 
         vm.prank(buyer);
-        trustTicket.withdrawResaleRevenue();
+        vm.expectRevert(TrustTicket.SettlementNotAvailable.selector);
+        trustTicket.withdrawResaleRevenue(tokenId);
+
+        TrustTicket.EventInfo memory eventInfo = trustTicket.getEventInfo(eventId);
+        vm.warp(eventInfo.eventTimestamp);
+        vm.prank(buyer);
+        trustTicket.withdrawResaleRevenue(tokenId);
 
         assertEq(buyer.balance, sellerBalanceBefore + 1.1 ether);
         assertEq(trustTicket.getResaleEscrowBalance(buyer), 0);
@@ -304,7 +361,7 @@ contract TrustTicketTest is Test {
         assertFalse(trustTicket.isTicketValid(tokenId));
     }
 
-    function testCanceledEventRefundsLatestResaleBuyerBeforeSellerWithdraw() public {
+    function testCanceledEventRefundsResaleBuyerAndPrimaryBuyerBeforeWithdraw() public {
         _buyPrimary(buyer, tokenId);
         vm.warp(resaleStart);
         vm.prank(buyer);
@@ -314,6 +371,7 @@ contract TrustTicketTest is Test {
         trustTicket.purchaseResaleTicket{value: 1.1 ether}(tokenId);
 
         uint256 buyer2BalanceBefore = buyer2.balance;
+        uint256 buyerBalanceBefore = buyer.balance;
         vm.prank(organizer);
         trustTicket.cancelEvent(eventId);
 
@@ -321,11 +379,15 @@ contract TrustTicketTest is Test {
         trustTicket.refundTicket(tokenId);
 
         assertEq(buyer2.balance, buyer2BalanceBefore + 1.1 ether);
+        assertEq(buyer.balance, buyerBalanceBefore + 1 ether);
         assertEq(trustTicket.getResaleEscrowBalance(buyer), 0);
+        assertEq(trustTicket.getEventEscrowBalance(eventId), 0);
     }
 
     function testRefundBlockedAfterOrganizerWithdraws() public {
         _buyPrimary(buyer, tokenId);
+        TrustTicket.EventInfo memory eventInfo = trustTicket.getEventInfo(eventId);
+        vm.warp(eventInfo.eventTimestamp);
         vm.prank(organizer);
         trustTicket.withdrawEventRevenue(eventId);
 
@@ -350,7 +412,7 @@ contract TrustTicketTest is Test {
         trustTicket.useTicket(tokenId);
 
         vm.prank(buyer);
-        vm.expectRevert(TrustTicket.TicketUsedError.selector);
+        vm.expectRevert(TrustTicket.TicketTransferRestricted.selector);
         trustTicket.transferFrom(buyer, buyer2, tokenId);
 
         vm.warp(resaleStart);
@@ -444,6 +506,8 @@ contract TrustTicketTest is Test {
         vm.prank(buyer);
         trustTicket.purchaseTicket{value: 1 ether}(rejectingToken);
 
+        TrustTicket.EventInfo memory rejectingEventInfo = trustTicket.getEventInfo(rejectingEvent);
+        vm.warp(rejectingEventInfo.eventTimestamp);
         vm.prank(address(rejectingOrganizer));
         vm.expectRevert(TrustTicket.PaymentTransferFailed.selector);
         trustTicket.withdrawEventRevenue(rejectingEvent);

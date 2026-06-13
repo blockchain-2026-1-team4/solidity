@@ -13,6 +13,7 @@ contract FanClubMembership is ERC721, AccessControl {
     error InvalidAddress();
     error AlreadyMember();
     error NotMember();
+    error MembershipTransferRestricted();
 
     event MembershipIssued(address indexed member, uint256 indexed tokenId);
     event MembershipRevoked(address indexed member, uint256 indexed tokenId);
@@ -48,6 +49,12 @@ contract FanClubMembership is ERC721, AccessControl {
     function membershipOf(address member) external view returns (uint256) {
         if (member == address(0)) revert InvalidAddress();
         return _membershipOf[member];
+    }
+
+    function _update(address to, uint256 tokenId, address auth) internal override returns (address from) {
+        from = _ownerOf(tokenId);
+        if (from != address(0) && to != address(0)) revert MembershipTransferRestricted();
+        return super._update(to, tokenId, auth);
     }
 
     function supportsInterface(bytes4 interfaceId) public view override(ERC721, AccessControl) returns (bool) {
